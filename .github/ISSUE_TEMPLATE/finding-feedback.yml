@@ -1,0 +1,41 @@
+name: "mcpaudit misfire report"
+description: "Report a false positive (safe code flagged) or a false negative (a real MCP vuln mcpaudit missed). Captured verbatim and read exactly as written."
+title: "[misfire] "
+labels: ["mcpaudit-feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Misfire reports are the single most useful
+        input for tuning the scanner. **Your description is stored and read
+        exactly as you write it — it is not summarized or paraphrased.** Be
+        as blunt as you like.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Misfire type
+      options:
+        - "False positive — safe code/manifest was flagged"
+        - "False negative — a real vulnerability was NOT caught"
+        - "Wrong severity / wrong location"
+        - "Other / not sure"
+    validations:
+      required: true
+  - type: input
+    id: rule
+    attributes:
+      label: Rule id (if applicable)
+      placeholder: "MCP002"
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened, in your own words
+      description: "Verbatim. Paste the finding mcpaudit printed and a minimal repro snippet (sanitize secrets)."
+      placeholder: "MCP002 fired on `const KEY = process.env.X` but KEY is only used as a request header, never returned to the model..."
+    validations:
+      required: true
+  - type: input
+    id: invocation
+    attributes:
+      label: Your mcpaudit invocation / version, if non-default
+      placeholder: "npx mcpaudit ./server --fail-on critical, v0.1.0"

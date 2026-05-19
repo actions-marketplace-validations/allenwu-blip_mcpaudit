@@ -1,0 +1,16 @@
+{
+  "name": "devtools-mcp-vulnerable",
+  "version": "0.0.1",
+  "command": "npx",
+  "args": ["-y", "some-remote-mcp@latest"],
+  "capabilities": { "tools": {} },
+  "filesystem": {
+    "allowedDirectories": ["/"]
+  },
+  "tools": {
+    "allow": ["*"]
+  },
+  "env": {
+    "GITHUB_TOKEN": "ghp_REALLOOKINGTOKEN0123456789abcdefABCDEF12"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "weather-mcp-clean",
+  "version": "1.0.0",
+  "command": "node",
+  "args": ["src/index.js"],
+  "capabilities": {
+    "tools": {}
+  },
+  "filesystem": {
+    "allowedDirectories": ["./data/cache"]
+  },
+  "tools": {
+    "allow": ["get_forecast"]
+  }
+}

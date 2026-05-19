@@ -1,0 +1,12 @@
+{
+  "name": "weather-mcp-clean",
+  "version": "1.0.0",
+  "description": "A well-behaved MCP server that exposes a read-only weather tool.",
+  "type": "module",
+  "bin": {
+    "weather-mcp-clean": "src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}

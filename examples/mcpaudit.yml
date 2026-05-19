@@ -1,0 +1,55 @@
+# Copy this into your repo as .github/workflows/mcpaudit.yml
+#
+# Gate MCP servers you vendor / depend on. By default the step fails the
+# job if any HIGH or CRITICAL finding is present. mcpaudit FAILS OPEN on an
+# internal error (it never crashes your pipeline) — if you want HARD
+# enforcement, make this job a required status check.
+
+name: mcpaudit
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  mcp-security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # only needed for the SARIF upload step below
+    steps:
+      - uses: actions/checkout@v4
+      - id: mcpaudit
+        uses: allenwu-blip/mcpaudit@v0 # pin to a release tag/SHA when published
+        with:
+          # Point at the MCP server(s) you ship or vendor. Use the repo root
+          # ('.') if the whole repo is the server.
+          path: "."
+          # critical | high | medium | low | none
+          fail-on: "high"
+          # Emit SARIF so findings show up in the Code scanning tab.
+          sarif: "true"
+          sarif-file: "mcpaudit.sarif"
+          # OPTIONAL continuous-monitoring: commit a baseline (see below) and
+          # set this to gate ONLY on NEW regressions, not accepted findings:
+          # baseline: ".mcpaudit-baseline.json"
+
+      # Upload to GitHub code scanning. `if: always()` so a gate failure
+      # still publishes the findings. Free; no extra service.
+      - name: Upload SARIF
+        if: always() && hashFiles('mcpaudit.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: mcpaudit.sarif
+
+# Ad-hoc, no workflow needed (fully offline, no token, no network):
+#   npx allenwu-blip/mcpaudit ./path-to-an-mcp-server
+#   npx allenwu-blip/mcpaudit ./server --json --fail-on critical
+#   npx allenwu-blip/mcpaudit ./server --sarif > mcpaudit.sarif
+#
+# Continuous monitoring (baseline diff — free, offline, no accounts):
+#   1. npx allenwu-blip/mcpaudit ./server --baseline-write .mcpaudit-baseline.json
+#   2. commit .mcpaudit-baseline.json
+#   3. in CI:  npx allenwu-blip/mcpaudit ./server --baseline .mcpaudit-baseline.json
+#      → only NEW findings (regressions) fail the build; triaged ones don't.

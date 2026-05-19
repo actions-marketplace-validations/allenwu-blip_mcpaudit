@@ -1,0 +1,13 @@
+{
+  "name": "git-mcp-borderline",
+  "version": "2.1.0",
+  "command": "node",
+  "args": ["src/index.js"],
+  "capabilities": { "tools": {} },
+  "filesystem": {
+    "allowedDirectories": ["./workspace", "./.cache/git-mcp"]
+  },
+  "tools": {
+    "allow": ["git_status", "git_log", "git_diff"]
+  }
+}
