@@ -23,19 +23,18 @@ it only reads it.
 These plugins run with real power *inside* the AI agent's loop — they can get a
 shell, your files, and the network on your machine, and whatever a plugin's
 tools output flows straight back into the AI's context where it can steer what
-the AI does next. An independent 2026 audit
-([dev.to writeup](https://dev.to/ecap0/the-state-of-mcp-server-security-in-2026-118-findings-across-68-packages-4fkd),
-corroborated by
-[The Register](https://www.theregister.com/security/2026/04/16/mcp-design-flaw-puts-200k-servers-at-risk-researcher/5222022))
-reported **118 security findings (5 critical, 9 high) across 68 of 194
-surveyed MCP packages** — command injection, environment/credential leakage
-into LLM-visible context, and over-broad filesystem/tool scope — and that
-**9 of 11 major MCP directories publish packages with zero automated
-security review**.
+the AI does next. Published MCP servers get inconsistent security review before people wire
+them in — the 2026 surveys from
+[dev.to](https://dev.to/ecap0/the-state-of-mcp-server-security-in-2026-118-findings-across-68-packages-4fkd)
+and
+[The Register](https://www.theregister.com/security/2026/04/16/mcp-design-flaw-puts-200k-servers-at-risk-researcher/5222022)
+give differing pictures of how widespread the risk is — but the failure
+modes are concrete: command injection, environment/credential leakage into
+LLM-visible context, and over-broad filesystem/tool scope.
 
-> Those numbers are **from that outside audit — this tool did not measure
-> them.** `mcpaudit` exists so you can run a check like that yourself, in
-> seconds, before letting someone else's plugin run inside your agent.
+> `mcpaudit` exists so you can run a concrete check for those patterns
+> yourself, in seconds, offline, before letting someone else's plugin run
+> inside your agent.
 
 ## Install / run
 
@@ -222,8 +221,8 @@ clear-eyed about what that means:
   Please [report misfires](FEEDBACK.md) — that is how it improves.
 - **No accuracy/benchmark numbers are claimed.** There is no published
   labeled corpus behind this tool, so it ships with **no precision/recall or
-  detection-rate figures**. The 118-findings statistic above is **cited from
-  an external audit, not produced by `mcpaudit`.**
+  detection-rate figures**, and it makes no claim about how it compares to
+  any external survey of the MCP ecosystem.
 - **The dependency layer is static and offline — and makes no CVE claim.**
   `MCP014` flags non-registry dependency *sources* and, as a *low advisory
   only*, names that are one edit from a popular package. It contacts **no
