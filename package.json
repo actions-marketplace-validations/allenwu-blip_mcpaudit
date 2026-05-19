@@ -1,5 +1,5 @@
 {
-  "name": "mcpaudit",
+  "name": "@allenwu06/mcpaudit",
   "version": "0.1.0",
   "description": "Static pre-install security scanner for MCP (Model Context Protocol) servers — `npx mcpaudit <path>` flags command injection, credential/env exfiltration into LLM-visible output, over-broad filesystem/tool scope and dynamic eval before you wire a server into your agent.",
   "type": "module",

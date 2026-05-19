@@ -56,7 +56,7 @@ GitHub: [link]
 
 ```
 mcpaudit is a static pre-install security scanner for MCP (Model Context Protocol)
-servers. Run `npx mcpaudit <path>` to check a server's JS/TS source and manifest
+servers. Run `npx @allenwu06/mcpaudit <path>` to check a server's JS/TS source and manifest
 for command injection, credential/env exfiltration into LLM-visible output,
 over-broad filesystem scope, unrestricted tool wildcards, dynamic eval, and unpinned
 remote execution — before wiring it into an AI agent. No install, no config, no
@@ -95,6 +95,6 @@ configuration, and human review.
   covered claims — the README explicitly disclaims these and adding them here
   would be an unsubstantiated assertion.
 - If you publish to npm before posting, substitute the real `npx` invocation
-  (e.g. `npx mcpaudit ./path`) in the Show HN body.
+  (e.g. `npx @allenwu06/mcpaudit ./path`) in the Show HN body.
 - A terminal screenshot of a real scan output against the vulnerable fixture in
   `test/fixtures/` is the most useful visual to add before posting.

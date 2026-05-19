@@ -6,7 +6,7 @@ Built & independently reviewed: real Node 20 static scanner, 66 tests green from
 1. Create a **public GitHub repo** under your account/org (e.g. `<owner>/mcpaudit`).
 2. `products/mcp-audit-cli/package.json`: set `"private": false` (required before any `npm publish`; the `npx <owner>/...` + Action path works regardless, but registry publish refuses while private).
 3. Replace `<OWNER>` placeholders in `README.md`/`examples/` with your real GitHub owner handle.
-4. Push `products/mcp-audit-cli/` to the repo root; tag a release (`v0` + SHA-pinned); optionally `npm publish` for true `npx mcpaudit`; enable Marketplace for the Action.
+4. Push `products/mcp-audit-cli/` to the repo root; tag a release (`v0` + SHA-pinned); optionally `npm publish --access public` for true `npx @allenwu06/mcpaudit` (published as `@allenwu06/mcpaudit` — npm scope = npm username allenwu06; reason: npm name-similarity policy blocks the bare name `mcpaudit`); enable Marketplace for the Action.
 5. Create label **`mcpaudit-feedback`** in that repo (the primary channel where real user reports come in, stored word-for-word, for this bet).
 6. Show HN / dev-channel post = the faceless way the work gets out (AI drafts; you post — any public technical claim is source-verified first).
 
