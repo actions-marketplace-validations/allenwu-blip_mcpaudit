@@ -1,5 +1,5 @@
 name: "mcpaudit — MCP server security scan"
-description: "Static pre-install security scan for MCP (Model Context Protocol) servers: flags command injection, credential/env exfiltration into LLM-visible output, over-broad filesystem/tool scope and dynamic eval. Fails open on internal error (never crashes your pipeline)."
+description: "Static pre-install security scan for MCP servers: flags command injection, secret exfiltration and over-broad scope."
 author: "mcpaudit"
 branding:
   icon: "shield"
