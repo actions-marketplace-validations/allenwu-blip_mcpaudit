@@ -285,7 +285,50 @@ function childProcessBindings(code) {
       }
     }
   }
-  return { cpNamespaces, cpFns };
+  // ALIASES. An imported exec function that is re-bound and called through the
+  // new name is invisible to a call-site match on the imported name. Dependency
+  // injection for testability does exactly this, and it is common:
+  //     import { spawn } from 'node:child_process';
+  //     private readonly spawnCommand: SpawnCommand = spawn;
+  //     child = spawnCommand(commandPath, args, { stdio: 'pipe', shell: false });
+  // Reported to me by the ms-365-mcp-server maintainer as the one real exec path
+  // in their runtime, which my scan had missed entirely. A false negative in a
+  // security tool is worse than any amount of noise, so aliases are resolved.
+  //
+  // Only bindings whose right-hand side is EXACTLY a known exec function (or
+  // `ns.execFn`) count. `const run = () => spawn(...)` is a wrapper, not an
+  // alias — the call inside it is already matched on its own.
+  // alias name -> the canonical child_process function it stands for, so the
+  // argv-form vs shell-form decision downstream still asks the right question.
+  const cpAliases = new Map();
+  const EXECISH = new Set(EXEC_FNS.concat(["execFile", "execFileSync"]));
+  const canonical = (rhs) => {
+    const dot = rhs.indexOf(".");
+    if (dot < 0)
+      return cpFns.has(rhs) && EXECISH.has(rhs)
+        ? rhs
+        : (cpAliases.get(rhs) ?? null);
+    return cpNamespaces.has(rhs.slice(0, dot)) && EXECISH.has(rhs.slice(dot + 1))
+      ? rhs.slice(dot + 1)
+      : null;
+  };
+  const aliasRe =
+    /(?:(?:const|let|var)\s+|(?:private|public|protected|readonly|static)\s+)*([A-Za-z_$][\w$]*)\s*(?::\s*[^=;\n]+?)?=\s*([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)?)\s*[;,\n)]/g;
+  // Two passes so an alias of an alias (`const a = spawn; const b = a;`)
+  // resolves too.
+  for (let pass = 0; pass < 2; pass++) {
+    aliasRe.lastIndex = 0;
+    let al;
+    while ((al = aliasRe.exec(code))) {
+      const lhs = al[1];
+      const rhs = al[2].replace(/\s+/g, "");
+      if (lhs === rhs || cpAliases.has(lhs)) continue;
+      const c = canonical(rhs);
+      if (c) cpAliases.set(lhs, c);
+    }
+  }
+
+  return { cpNamespaces, cpFns, cpAliases };
 }
 
 function ruleCommandInjection(orig, masked, file, findings) {
@@ -294,7 +337,7 @@ function ruleCommandInjection(orig, masked, file, findings) {
   // (e.g. "child_process") is blanked in masked code, so binding detection
   // must read orig. Call SITES are still matched in masked code below, so a
   // commented-out call never fires regardless.
-  const { cpNamespaces, cpFns } = childProcessBindings(orig);
+  const { cpNamespaces, cpFns, cpAliases } = childProcessBindings(orig);
   if (cpNamespaces.size === 0 && cpFns.size === 0) return; // no CP usage
 
   const nsAlt = [...cpNamespaces].map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
@@ -304,54 +347,115 @@ function ruleCommandInjection(orig, masked, file, findings) {
   const qualified = nsAlt.length
     ? new RegExp(`\\b(?:${nsAlt.join("|")})\\.(${fnList.join("|")})\\s*\\(`, "g")
     : null;
-  const bareNames = fnList.filter((f) => cpFns.has(f));
+  // Aliases join the bare-name list; the matched text is mapped back to the
+  // canonical function so `isArgvForm` below still asks the right question.
+  const bareNames = fnList.filter((f) => cpFns.has(f)).concat([...cpAliases.keys()]);
   const bare = bareNames.length
     ? new RegExp(`(?<![.\\w$])(${bareNames.join("|")})\\s*\\(`, "g")
     : null;
 
+  // `this.spawnCommand(...)` where the field was initialised from `spawn`. Only
+  // `this.` is allowed: the alias name came from a real binding in this file, but
+  // matching any `X.alias(` would start guessing about other objects.
+  const aliasNames = [...cpAliases.keys()];
+  const thisAlias = aliasNames.length
+    ? new RegExp(`\\bthis\\s*\\.\\s*(${aliasNames.join("|")})\\s*\\(`, "g")
+    : null;
+
   const sites = [];
-  for (const re of [qualified, bare]) {
+  for (const re of [qualified, bare, thisAlias]) {
     if (!re) continue;
     let mm;
     while ((mm = re.exec(code))) sites.push({ fn: mm[1], at: mm.index });
   }
   sites.sort((a, b) => a.at - b.at);
+  // A `this.x(` match and a bare `x(` match can overlap on the same call.
+  const seen = new Set();
 
   for (const site of sites) {
-    const fn = site.fn;
+    const fn = cpAliases.get(site.fn) ?? site.fn;
     const openIdx = code.indexOf("(", site.at);
     if (openIdx < 0) continue;
+    if (seen.has(openIdx)) continue;
+    seen.add(openIdx);
     const { firstArg, fullArgs } = scanCallArgs(code, openIdx);
-    const isExecFile = /execFile/.test(fn);
-    const firstKind = argIsNonLiteral(firstArg);
+    let firstKind = argIsNonLiteral(firstArg);
     const shellTrue = /shell\s*:\s*true/.test(fullArgs);
 
-    // execFile/execFileSync: program is arg1, dynamic values go in the argv
-    // array — the SAFE pattern. Only dangerous if the PROGRAM itself is
-    // non-literal, or shell:true is set with a non-literal anywhere.
-    if (isExecFile) {
-      const progDanger = firstKind === true; // a non-literal program name
-      const shellDanger = shellTrue && argIsNonLiteral(fullArgs) === true;
-      if (!progDanger && !shellDanger) continue;
+    // A `const` bound to a string literal IS a literal. Naming the program
+    // before running it is ordinary style, and a platform switch between two
+    // literals is the normal way to write a cross-platform call:
+    //     const command = 'ping';
+    //     const command = isWindows ? 'tasklist' : 'ps';
+    //     spawn(command, args, { shell: false })
+    // Treating the identifier as dynamic reported `ping` as an attacker-chosen
+    // binary. `const` cannot be rebound, so resolving one hop is sound.
+    if (firstKind === true) {
+      const nm = /^[A-Za-z_$][\w$]*$/.exec(firstArg.trim())?.[0];
+      if (nm) {
+        const bind = new RegExp(
+          `(?:^|[\\n;{}])\\s*const\\s+${nm}\\s*=\\s*([^;\\n]+)`,
+        ).exec(orig);
+        const rhs = bind?.[1]?.trim();
+        // `${` disqualifies a template literal: that is interpolation, which is
+        // the very thing this rule exists to catch.
+        const PURE_LITERAL = /^(['"`])[^'"`\n]*\1$/;
+        const TERNARY_OF_LITERALS =
+          /\?\s*(['"`])[^'"`\n]*\1\s*:\s*(['"`])[^'"`\n]*\2$/;
+        if (
+          rhs &&
+          !rhs.includes("${") &&
+          (PURE_LITERAL.test(rhs) || TERNARY_OF_LITERALS.test(rhs))
+        ) {
+          firstKind = false;
+        }
+      }
+    }
+
+    // ARGV FORM vs SHELL FORM.
+    // `execFile`, and also `spawn`/`spawnSync`/`fork` when `shell: true` is
+    // NOT set, do not go through a shell: arg1 is the program path and every
+    // dynamic value travels in the argv array. That is the exact mitigation
+    // security guidance tells people to use instead of `exec()`, so reporting
+    // it as "command injection / would run arbitrary shell" is both wrong and
+    // insulting to a codebase that did the right thing. Only `exec`/`execSync`
+    // always parse arg1 as a shell command line.
+    const isArgvForm =
+      (/execFile/.test(fn) || /^(?:spawn|spawnSync|fork)$/.test(fn)) && !shellTrue;
+
+    let severity = "critical";
+    let message;
+    let remediation;
+
+    if (isArgvForm) {
+      // Args are safe by construction here; the only remaining question is
+      // who decides WHICH program runs.
+      if (firstKind !== true) continue;
+      // A zero-argument resolver (`getAdbPath()`, `resolveBinary()`) is the
+      // idiomatic way to locate a platform tool and is a far cry from a bare
+      // variable that might carry tool input. Report it, but not as critical.
+      const isResolverCall = /^[\w$]+(?:\s*\.\s*[\w$]+)*\s*\(\s*\)$/.test(firstArg.trim());
+      severity = isResolverCall ? "medium" : "high";
+      message =
+        `\`${fn}()\` runs a program whose PATH is non-literal. Arguments here go through the argv array, so there is no shell and no argument injection — ` +
+        (isResolverCall
+          ? "and the path comes from a resolver call, which is the normal way to locate a platform tool. Reported so you can confirm that resolver cannot be steered (PATH lookup, env var, or config an attacker can write), because whoever controls it controls which binary the agent executes."
+          : "but whoever controls this value controls which binary the agent executes. If it can be reached from MCP tool input, that is arbitrary program execution.");
+      remediation =
+        "Resolve the program from a fixed absolute path or an allowlist of known binaries; do not let tool input, `PATH`, or user-writable config decide which executable runs.";
     } else {
-      // exec/execSync/spawn/spawnSync/fork: arg1 is the command string.
+      // exec/execSync (always a shell), or anything with shell:true.
       const cmdDanger = firstKind === true;
       const shellDanger = shellTrue && argIsNonLiteral(fullArgs) === true;
       if (!cmdDanger && !shellDanger) continue;
+      message = `\`${fn}()\` is invoked with a non-literal command${shellTrue ? " (shell:true)" : ""}. If any interpolated/variable part can reach this from an MCP tool argument it is a command-injection sink — a tool the LLM calls would run arbitrary shell.`;
+      remediation =
+        "Use `execFile(cmd, [args])` with a fixed command string and an argv array (no shell). Strictly validate/allowlist any input; never interpolate tool input into a shell command.";
     }
 
     const at = lineColAt(code, openIdx);
     findings.push(
-      mkFinding(
-        "MCP001",
-        "critical",
-        file,
-        at.line,
-        at.col,
-        `\`${fn}()\` is invoked with a non-literal command${shellTrue ? " (shell:true)" : ""}. If any interpolated/variable part can reach this from an MCP tool argument it is a command-injection sink — a tool the LLM calls would run arbitrary shell.`,
-        "Use `execFile(cmd, [args])` with a fixed command string and an argv array (no shell). Strictly validate/allowlist any input; never interpolate tool input into a shell command.",
-        orig,
-      ),
+      mkFinding("MCP001", severity, file, at.line, at.col, message, remediation, orig),
     );
   }
 }
@@ -374,7 +478,23 @@ function ruleEnvExfiltration(orig, masked, file, findings) {
     if (!/process\.env\b/.test(cLine)) continue; // comment/static-string only
 
     const inText = /\btext\s*:/.test(cLine);
-    const inReturn = /\breturn\b/.test(cLine);
+
+    // `inReturn` used to be "this line contains the word return", which is not
+    // the same thing as "the returned value contains process.env":
+    //     if (process.env.MODE === 'off') return 'off:mode';   // returns a literal
+    //     return process.env.NODE_ENV === 'development';        // returns a boolean
+    //     return !!process.env.OPENAI_API_KEY;                  // returns a boolean
+    // The first leaks nothing (env is in the *condition*); the other two leak
+    // only whether a variable is set, not its value. Across seven real MCP
+    // servers this shape was the single largest MCP002 false-positive source.
+    const retIdx = cLine.search(/\breturn\b/);
+    const returned = retIdx >= 0 ? cLine.slice(retIdx + 6) : "";
+    const envIsReturned = /process\.env\b/.test(returned);
+    // A comparison or coercion yields a boolean, not the secret itself.
+    const returnsBoolean =
+      /(?:[=!]==?|\bin\b)\s*[^=]|^\s*!!|\bBoolean\s*\(/.test(returned) &&
+      !/\btext\s*:/.test(returned);
+    const inReturn = envIsReturned && !returnsBoolean;
     const inToolCall =
       /\.(tool|registerTool|setRequestHandler|prompt|resource)\s*\(/.test(
         cLine,
@@ -394,14 +514,23 @@ function ruleEnvExfiltration(orig, masked, file, findings) {
       : inToolCall
         ? "a tool/handler declaration (e.g. its description)"
         : "a returned value";
+    // `text:` and a tool declaration are unambiguously model-visible. A plain
+    // `return process.env.X` is not: lexically, a config getter
+    // (`return process.env.LOG_DIR`) and a tool handler that hands the value
+    // to the model are the same shape, and the former is far more common.
+    // Report it, but do not let it dominate a `--fail-on high` gate.
+    const bareReturn = !inText && !inToolCall;
     findings.push(
       mkFinding(
         "MCP002",
-        "high",
+        bareReturn ? "medium" : "high",
         file,
         li + 1,
         col,
-        `\`process.env\` is placed into ${where}, which is visible to the LLM. Environment variables routinely hold API keys, tokens and DB URLs; exposing them to the model leaks credentials into its context (and any logs/telemetry of the conversation).`,
+        `\`process.env\` is placed into ${where}, which is visible to the LLM. Environment variables routinely hold API keys, tokens and DB URLs; exposing them to the model leaks credentials into its context (and any logs/telemetry of the conversation).` +
+          (bareReturn
+            ? " Reported at MEDIUM: this is a bare `return`, and a config getter looks identical to a tool handler at this level of analysis. If this function only feeds internal configuration, ignore it."
+            : ""),
         "Never return `process.env` (or whole config objects) to the model. Return only the specific, non-secret fields the tool needs; read secrets into local variables used solely for outbound auth.",
         orig,
       ),
@@ -577,13 +706,127 @@ function ruleUnpinnedRemoteExecSource(orig, masked, file, findings) {
 // AND a non-literal argument. A pure literal merge target does not fire.
 // ---------------------------------------------------------------------------
 
+// Capture an optional receiver so we can tell `_.set(o, path, v)` (a lodash
+// deep-set — a real pollution sink) from `map.set(k, v)` (a Map write, which
+// cannot reach Object.prototype at all).
+// The receiver group must also match `)` and `]`, because `getClients().set(k,v)`
+// and `arr[i].set(k,v)` are method calls too — capturing only bare identifiers
+// let those through as if they were free-standing `set(...)` calls.
+// `[!?]?` before the dot matters in TypeScript: a non-null assertion or an
+// optional chain sits between the receiver and the method —
+//     this.similarityMatrix.get(key)!.set(otherKey, similarity)
+// — and without it the receiver group fails to match at all, so a plain
+// `Map.set` was reported as a free-standing lodash-style `set(...)`.
 const POLLUTION_MERGE_FNS =
-  /\b(_\s*\.\s*)?(merge|mergeWith|defaultsDeep|set|setWith|assignIn|assignInWith|extend|extendWith|mixin|deepmerge|deepMerge|deepAssign|defaults)\s*\(/g;
+  /(?:([A-Za-z_$][\w$]*|\)|\])\s*[!?]?\s*\.\s*)?\b(merge|mergeWith|defaultsDeep|set|setWith|assignIn|assignInWith|extend|extendWith|mixin|deepmerge|deepMerge|deepAssign|defaults)\s*\(/g;
+
+// These names are also ordinary methods on Map/Set/WeakMap/TypedArray/URL-
+// SearchParams/Headers and on countless library objects. Matching them on any
+// receiver made this rule fire on `transports.set(sessionId, t)` and
+// `buffer.set(chunk, offset)` — the single largest false-positive source in
+// the ruleset. For these names we require either a bare call (an imported
+// `set`/`merge`) or an explicit lodash-style receiver.
+const AMBIGUOUS_SINK_NAMES = new Set([
+  "set",
+  "setWith",
+  "extend",
+  "extendWith",
+  "defaults",
+  "mixin",
+  "assignIn",
+  "assignInWith",
+]);
+const LODASH_RECEIVERS = new Set(["_", "lodash", "ld"]);
+
 const PROTO_TOKEN = /\b(__proto__|prototype|constructor)\b/;
+
+// `constructor` is also the keyword for a class's own constructor, which every
+// class in every OO codebase declares. Testing a whole FILE for `\bconstructor\b`
+// therefore succeeded on essentially every TypeScript file ever written, so the
+// "does this file show any prototype awareness" gate below gated nothing: it was
+// satisfied by `constructor() {` in 100% of the class files sampled across the
+// 12 servers scanned so far — including the file holding the one true positive,
+// which was firing by accident rather than on its own merits.
+// Strip member-position constructor DECLARATIONS before testing. A `.constructor`
+// property access is preceded by a dot and so is never stripped — that one is
+// real evidence.
+const CLASS_CTOR_DECL =
+  /(?:^|[\n;{}])[ \t]*(?:(?:public|private|protected|readonly|abstract|override|declare|static)[ \t]+)*constructor[ \t]*(?=\()/g;
+
+// `rawText` is the unmasked source. Masking blanks string literals, which
+// destroys the most explicit evidence there is — `o["__proto__"][k] = v` and
+// `if (k === "__proto__") return` both go blank. `__proto__` is specific
+// enough that its presence anywhere, string or comment, is real awareness;
+// `prototype`/`constructor` are not, so those are still read from masked code
+// only, where prose cannot reach them.
+function hasProtoAwareness(text, rawText) {
+  if (PROTO_TOKEN.test(text.replace(CLASS_CTOR_DECL, "\n"))) return true;
+  return rawText !== undefined && /__proto__/.test(rawText);
+}
+
+// Identifiers whose *name* says the value came from outside the process. In an
+// MCP server the tool handler's argument object is the attacker-controlled
+// surface, so a key rooted at one of these is the shape that actually matters:
+//     this.branches[input.branchId] = []
+// Deliberately tight. `data`, `options`, `config` and `opts` are left out: they
+// name internal state at least as often as external input, and admitting them
+// puts the noise straight back.
+const EXTERNAL_KEY_ROOTS = new Set([
+  "input",
+  "args",
+  "params",
+  "parameters",
+  "req",
+  "request",
+  "body",
+  "query",
+  "payload",
+  "userInput",
+  "toolInput",
+  "requestBody",
+  "rawInput",
+]);
+
+// A numeric key can never be `__proto__`. JS coerces a computed key to a string
+// and "0"/"17" are not the proto keys, so the entire numeric-array family —
+// `embedding[i]`, `matrix[i][j] = Math.min(...)`, `buffer[i]`, `data[y][x]` —
+// is not a pollution sink under any input. Lexically it is indistinguishable
+// from an object write, so we confirm the index is a literal number or a
+// visible `for` counter initialised to one.
+function isNumericKey(keyExpr, lines, li) {
+  const k = keyExpr.trim();
+  if (/^-?\d+$/.test(k)) return true;
+  if (!/^[\w$\s+\-*/%()]+$/.test(k)) return false; // no `.`, no strings, no calls
+  const ids = k.match(/[A-Za-z_$][\w$]*/g) || [];
+  if (!ids.length) return /^[-\d\s+*/%()]+$/.test(k); // pure arithmetic
+  const win = lines.slice(Math.max(0, li - 60), li + 1).join("\n");
+  return ids.every((id) =>
+    new RegExp(`for\\s*\\([^;)]*\\b(?:let|var|const)\\s+${id}\\s*=\\s*-?\\d`).test(
+      win,
+    ),
+  );
+}
+
+// Is the key visibly rooted at external input — either named as such, or bound
+// from something named as such within the preceding window?
+function keyIsExternal(keyExpr, lines, li) {
+  const root = /^[A-Za-z_$][\w$]*/.exec(keyExpr.trim())?.[0];
+  if (!root) return false;
+  if (EXTERNAL_KEY_ROOTS.has(root)) return true;
+  const win = lines.slice(Math.max(0, li - 40), li).join("\n");
+  const m = new RegExp(
+    `(?:const|let|var)\\s+(?:\\{[^}\\n]*\\b${root}\\b[^}\\n]*\\}|${root})\\s*=\\s*` +
+      `(?:await\\s+)?([A-Za-z_$][\\w$]*)` +
+      `|for\\s*\\([^)\\n]*\\b${root}\\b[^)\\n]*\\bof\\b[^)\\n]*?([A-Za-z_$][\\w$]*)\\s*[.)]`,
+  ).exec(win);
+  const from = m && (m[1] || m[2]);
+  return !!from && EXTERNAL_KEY_ROOTS.has(from);
+}
 
 function ruleProtoPollution(orig, masked, file, findings) {
   const { code } = masked;
   const lines = code.split("\n");
+  const rawLines = orig.split("\n");
 
   // (a) computed assignment whose lvalue is a dynamic property chain. We
   // require: a bracket-access lvalue with a non-literal (identifier) index,
@@ -594,37 +837,185 @@ function ruleProtoPollution(orig, masked, file, findings) {
   // BOTH a `]=`/`] =` computed-assign shape AND a proto token somewhere in
   // the (masked) file is required for the assignment to be reported, so
   // generic `arr[i]=x` never fires.
-  const fileHasProtoToken = PROTO_TOKEN.test(code);
+  const fileHasProtoToken = hasProtoAwareness(code, orig);
   for (let li = 0; li < lines.length; li++) {
     const L = lines[li];
-    // computed-assignment lvalue: ...[ <something non-empty> ] = (not ==)
-    const m = /\[[^\]\n]+\]\s*=(?!=)/.exec(L);
+    // Computed-assignment lvalue: `<expr>[ key ] = value` (not `==`).
+    // The leading `[\w$)\]]` matters: without it this also matched ARRAY
+    // DESTRUCTURING, which is everywhere in modern JS and has nothing to do
+    // with prototype pollution —
+    //     const [a, b] = ipv4Parts.map(Number);
+    //     const [clientId, clientSecret] = credentials.split(':');
+    //     const [, existing] = await Promise.all([...]);
+    // — as well as TypeScript tuple annotations like `): [string, T] =>`.
+    // A real computed assignment always has an object expression immediately
+    // before the bracket: an identifier, a `)`, or a `]`.
+    const m = /[\w$)\]]\s*\[[^\]\n]+\]\s*=(?![=>])/.exec(L);
     if (!m) continue;
+    // `[\w$)\]]` alone is not enough: the `t` of `const` is a word character,
+    // so `const [a, b] = x` still matched. Reject when the token immediately
+    // before the bracket is a keyword that introduces a binding or an
+    // expression rather than an object being indexed.
+    const lead = /([A-Za-z_$][\w$]*)\s*\[[^\]\n]+\]\s*=(?![=>])/.exec(L);
+    if (
+      lead &&
+      /^(?:const|let|var|return|of|in|await|typeof|case|yield|new|delete|void|do|else)$/.test(
+        lead[1],
+      )
+    ) {
+      continue;
+    }
     const idx = L.slice(L.indexOf("[", m.index === 0 ? 0 : 0));
     // crude: the bracket segment just before `=`
-    const seg = /\[([^\]\n]+)\]\s*=(?!=)/.exec(L);
+    const seg = /\[([^\]\n]+)\]\s*=(?![=>])/.exec(L);
     const keyExpr = seg ? seg[1].trim() : "";
     const keyIsLiteral = keyExpr === ""; // masked: string literal → blank
-    const keyIsNumber = /^\d+$/.test(keyExpr);
-    const lineHasProto = PROTO_TOKEN.test(L);
-    // Fire only if: the assigned key is a non-literal (variable/expr) AND
-    // either this line names a proto token, or the file does (a recursive
-    // assignment helper in the same module). Numeric indices (arrays) and
-    // pure-literal keys never fire.
+    const keyIsNumber = isNumericKey(keyExpr, lines, li);
+    const lineHasProto = hasProtoAwareness(L, rawLines[li]);
+    // Fire only if the assigned key is a non-literal (variable/expr) AND we
+    // have some actual evidence it could be attacker-influenced. Numeric
+    // indices (arrays) and pure-literal keys never fire.
     if (keyIsLiteral || keyIsNumber) {
       if (!lineHasProto) continue;
     }
-    if (!(lineHasProto || (fileHasProtoToken && !keyIsLiteral && !keyIsNumber)))
-      continue;
+    // Two independent kinds of evidence, in descending confidence:
+    //   external — the key is visibly rooted at tool input, e.g.
+    //              `this.branches[input.branchId] = []`. This is the shape
+    //              worth a high; it is the one true positive in the corpus.
+    //   proto    — the file genuinely mentions `__proto__`/`prototype`/
+    //              `.constructor`, so it is doing something with the proto
+    //              chain and a dynamic write here deserves a look. We cannot
+    //              see where the key came from, so this is a medium, not a
+    //              high — claiming high on "the file says prototype somewhere"
+    //              is the overreach that produced 57 findings in one repo.
+    // A key declared with a TypeScript union of string literals is a CLOSED
+    // SET, and the members are right there to read:
+    //     private redirectToSharedShape(
+    //       property: "argsShape" | "outputSchema", shape: ZodRawShape) {
+    //       this[property] = shape;
+    // Unlike an allowlist held in a named Set, nothing here is hidden from a
+    // lexical reader — so this is a suppression, not a downgrade. Read from
+    // the raw lines because masking blanks the literals.
+    const keyIdent = /^[\w$]+$/.test((keyExpr || "").trim())
+      ? keyExpr.trim()
+      : null;
+    if (keyIdent) {
+      const sigWin = rawLines.slice(Math.max(0, li - 30), li).join("\n");
+      const union = new RegExp(
+        `\\b${keyIdent}\\s*\\??\\s*:\\s*((?:["'][^"'\\n]*["']\\s*(?:\\|\\s*)?)+)`,
+      ).exec(sigWin);
+      if (union) {
+        const members = union[1].match(/["']([^"'\n]*)["']/g) || [];
+        const names = members.map((s) => s.slice(1, -1));
+        if (
+          names.length &&
+          !names.some((n) => /^(?:__proto__|constructor|prototype)$/.test(n))
+        ) {
+          continue;
+        }
+      }
+    }
+
+    const external =
+      !keyIsLiteral && !keyIsNumber && keyIsExternal(keyExpr, lines, li);
+    const protoEvidence =
+      lineHasProto || (fileHasProtoToken && !keyIsLiteral && !keyIsNumber);
+    if (!(external || protoEvidence)) continue;
+    // ALLOWLIST-GUARDED KEY. The idiomatic safe form of a computed assignment
+    // is to check the key against a fixed set first:
+    //     if (FORWARDABLE_REQUEST_HEADERS.has(name.toLowerCase())) {
+    //       forwardedHeaders[name] = value;
+    //     }
+    // `__proto__` cannot reach the assignment unless somebody put it in the
+    // allowlist. An explicit `key === '__proto__'` rejection counts too.
+    // Downgrade rather than suppress: we can see a guard, not what is in it.
+    const keyId = /^[\w$]+/.exec(keyExpr || "")?.[0];
+    let guarded = null;
+    if (keyId) {
+      const win = lines.slice(Math.max(0, li - 25), li).join("\n");
+      const rawWin = rawLines.slice(Math.max(0, li - 25), li).join("\n");
+      const allow = new RegExp(
+        `([\\w$.]+)\\s*\\.\\s*(?:has|includes|hasOwnProperty)\\s*\\(\\s*${keyId}\\b`,
+      ).exec(win);
+      // `Object.hasOwn(obj, key)` is the modern spelling of the same guard and
+      // takes its arguments the other way round, so the receiver-first pattern
+      // above never matched it. Recognising `hasOwnProperty` but not `hasOwn`
+      // rewards the legacy form and reports the one MDN recommends.
+      const hasOwn = new RegExp(
+        `Object\\s*\\.\\s*hasOwn\\s*\\(\\s*([\\w$.]+)\\s*,\\s*${keyId}\\b`,
+      ).exec(win);
+      if (allow) guarded = allow[1];
+      else if (hasOwn) guarded = `Object.hasOwn(${hasOwn[1]}, …)`;
+      // An explicit comparison against `__proto__`, either way round. The old
+      // form of this test was `__proto__[\s\S]{0,40}${keyId}` — mere proximity,
+      // which counts an unrelated `const BAD = '__proto__'` two lines up as if
+      // it were a guard. A guard is a comparison, so require one.
+      else if (
+        new RegExp(`${keyId}\\s*[!=]==?\\s*["'\`]?__proto__`).test(rawWin) ||
+        new RegExp(`__proto__["'\`]?\\s*[!=]==?\\s*${keyId}\\b`).test(rawWin)
+      ) {
+        guarded = "an explicit __proto__ check";
+      } else {
+        // A named validator called on the key just above. Read its body in the
+        // same file rather than trusting the name — the same treatment MCP010
+        // gives path validators. This is what `assertSafeCompanyId(companyId)`
+        // guarding `RESERVED_KEYS = new Set(['__proto__', …])` looks like, and
+        // without it the reserved-key set is read as evidence of danger rather
+        // than as the mitigation it is.
+        const vcall = new RegExp(
+          `(?:^|[\\n;{}])\\s*(?:await\\s+)?(?:[\\w$]+\\s*\\.\\s*)?([\\w$]+)\\s*\\(\\s*${keyId}\\s*\\)`,
+        ).exec(win);
+        if (vcall) {
+          const fn = vcall[1];
+          const defRe = new RegExp(
+            `function\\s+${fn}\\s*\\(` +
+              `|(?:const|let|var)\\s+${fn}\\s*=` +
+              `|[\\n;{]\\s*(?:(?:private|public|protected|static|async|readonly)\\s+)*${fn}\\s*\\(`,
+          );
+          const d = defRe.exec(orig);
+          if (d) {
+            const body = orig.slice(d.index, d.index + 600);
+            if (/__proto__|["'`]prototype["'`]|["'`]constructor["'`]/.test(body)) {
+              guarded = fn;
+            } else {
+              // One hop further. The validator usually does not spell the keys
+              // itself — it defers to a named set, and THAT is where the proto
+              // keys live:
+              //     const RESERVED_KEYS = new Set(['__proto__', …]);
+              //     function assertSafeCompanyId(id) {
+              //       if (RESERVED_KEYS.has(id)) throw …
+              // Stopping at the validator body misses the whole idiom, so
+              // resolve the set it consults and look there. One hop only.
+              const viaSet = /([A-Za-z_$][\w$]*)\s*\.\s*(?:has|includes)\s*\(/.exec(
+                body,
+              );
+              if (viaSet) {
+                const sd = new RegExp(
+                  `(?:const|let|var)\\s+${viaSet[1]}\\s*=`,
+                ).exec(orig);
+                if (sd && /__proto__/.test(orig.slice(sd.index, sd.index + 200)))
+                  guarded = `${fn}() via ${viaSet[1]}`;
+              }
+            }
+          }
+        }
+      }
+    }
+
     const col = L.indexOf("[", m.index >= 0 ? 0 : 0) + 1;
     findings.push(
       mkFinding(
         "MCP007",
-        "high",
+        guarded ? "low" : external ? "high" : "medium",
         file,
         li + 1,
         col > 0 ? col : 1,
-        "Computed property assignment with an attacker-influenceable key (a recursive/dynamic `obj[key] = value` reachable from tool input where `key` can be `__proto__`/`constructor`/`prototype`). This is a prototype-pollution sink: poisoning `Object.prototype` can corrupt every object in the process and is a common RCE/auth-bypass primitive.",
+        "Computed property assignment with an attacker-influenceable key (a recursive/dynamic `obj[key] = value` reachable from tool input where `key` can be `__proto__`/`constructor`/`prototype`). This is a prototype-pollution sink: poisoning `Object.prototype` can corrupt every object in the process and is a common RCE/auth-bypass primitive." +
+          (guarded
+            ? ` Reported at LOW: the key looks allowlist-guarded by \`${guarded}\` just above this assignment, which is the correct defence. mcpaudit cannot see what that set contains, so confirm \`__proto__\`, \`constructor\` and \`prototype\` are not in it.`
+            : external
+              ? ""
+              : " Reported at MEDIUM rather than HIGH: this file references the prototype chain, but mcpaudit cannot see where the key comes from. If it is an internal identifier rather than tool input, this is not exploitable."),
         "Reject keys equal to `__proto__`, `prototype`, or `constructor`; use a `Map`, `Object.create(null)`, or `Object.defineProperty` with `Object.hasOwn` guards. Validate tool input against a strict schema before using it as an object key.",
         orig,
       ),
@@ -635,10 +1026,38 @@ function ruleProtoPollution(orig, masked, file, findings) {
   let mm;
   POLLUTION_MERGE_FNS.lastIndex = 0;
   while ((mm = POLLUTION_MERGE_FNS.exec(code))) {
+    const receiver = mm[1]; // undefined for a bare `merge(a, b)` call
     const fnName = mm[2];
+    // `map.set(k, v)` / `buf.set(chunk, off)` are not deep merges. Only a bare
+    // call or a lodash-style receiver can be the deep-set we care about.
+    if (
+      AMBIGUOUS_SINK_NAMES.has(fnName) &&
+      receiver !== undefined &&
+      !LODASH_RECEIVERS.has(receiver)
+    ) {
+      continue;
+    }
     const openIdx = code.indexOf("(", mm.index);
     if (openIdx < 0) continue;
-    const { fullArgs } = scanCallArgs(code, openIdx);
+    const { fullArgs, end } = scanCallArgs(code, openIdx);
+    // A DECLARATION is not a call. Both of these parse here as a bare
+    // `set(...)` invocation carrying two non-literal arguments:
+    //     public set(key: K, value: V, ttlMs?: number): void {
+    //     set(\n  key: string,\n  value: string,\n  size: number\n): void {
+    // Three independent tells, any one of which settles it: the parameter list
+    // carries type annotations; a function body opens right after the closing
+    // paren; or a member modifier sits immediately before the name.
+    const paramList = splitTopLevel(fullArgs).some((p) =>
+      /^(?:\.\.\.)?[\w$]+\??\s*:\s*\S/.test(p.trim()),
+    );
+    const bodyFollows = /^\s*(?::\s*[^;={]{1,80})?\{/.test(
+      code.slice(end + 1, end + 120),
+    );
+    const declModifier =
+      /(?:^|[\n;{}])[ \t]*(?:(?:public|private|protected|readonly|abstract|override|declare|static|async)[ \t]+)+\*?[ \t]*$|\bfunction[ \t]+$/.test(
+        code.slice(Math.max(0, mm.index - 60), mm.index),
+      );
+    if (paramList || bodyFollows || declModifier) continue;
     // A literal-only merge (e.g. `_.merge(a, { fixed: 1 })`) masks the object
     // text away but keeps `{}` / identifiers. Require a bare identifier
     // source argument (the classic `merge(target, untrustedInput)` shape):
@@ -774,6 +1193,18 @@ function ruleSsrfFetch(orig, masked, file, findings) {
     // ORIGINAL source at the same offsets so literal text is visible to
     // classifyUrlExpr (origin-fixed detection needs the literal contents).
     const { end } = scanCallArgs(code, openIdx);
+
+    // NOT A CALL: `async fetch(request) { ... }` is a METHOD DEFINITION. It is
+    // the standard server entry point for Bun, Deno and Cloudflare Workers —
+    //     const server = Bun.serve({ port, async fetch(req) { ... } });
+    // — so flagging it as an outbound SSRF sink is backwards: that handler
+    // *receives* requests. A definition is followed by its body `{`; a real
+    // call is followed by `;`, `.`, `,`, `)` or an operator.
+    const after = code.slice(end).match(/^\s*(.)/);
+    if (after && after[1] === "{") continue;
+    const before = code.slice(Math.max(0, m.index - 24), m.index);
+    if (/\b(?:async|function)\s+$/.test(before)) continue;
+
     const origInner = orig.slice(openIdx + 1, end);
     const oParts = splitTopLevel(origInner);
     const arg1 = (oParts[0] || "").trim();
@@ -781,6 +1212,25 @@ function ruleSsrfFetch(orig, masked, file, findings) {
     const urlExpr = arg1 !== "" ? arg1 : urlField ? urlField[1].trim() : "";
     if (urlExpr === "") continue;
     if (classifyUrlExpr(urlExpr) === "safe") continue;
+
+    // HOISTED-LITERAL GUARD, mirroring MCP010's hoisted containment. Pulling a
+    // fixed endpoint out into a named constant is the *tidier* way to write it:
+    //     const LATEST_SOURCE = "https://example.dev/latest.ts";
+    //     await fetch(LATEST_SOURCE, { headers: { accept: "text/plain" } });
+    // Judging the identifier alone calls that an attacker-controlled origin.
+    // If the nearest assignment before this call is a plain string literal, the
+    // origin is as fixed as an inline literal.
+    if (/^[\w$]+$/.test(urlExpr)) {
+      const beforeSrc = orig.slice(0, m.index);
+      const assignRe = new RegExp(
+        `(?:\\b(?:const|let|var)\\s+${urlExpr}\\s*=|(?<![.\\w$])${urlExpr}\\s*=(?!=))([^;\\n]+)`,
+        "g",
+      );
+      let a;
+      let lastRhs = null;
+      while ((a = assignRe.exec(beforeSrc))) lastRhs = a[1];
+      if (lastRhs && classifyUrlExpr(lastRhs.trim()) === "safe") continue;
+    }
     const at = lineColAt(code, m.index);
     const sink = m[1] || `https.${m[3] || ""}`;
     findings.push(
@@ -841,6 +1291,22 @@ const SECRET_PATTERNS = [
 const SECRET_PLACEHOLDER =
   /\b(x{4,}|your[-_]|example|changeme|placeholder|dummy|redacted|sample|test[-_]?key|fake|<[^>]+>|\.\.\.|insert[-_]|todo)\b/i;
 
+// Some keys are SUPPOSED to ship. Browser-delivered Google/Firebase/Stripe
+// publishable keys are restricted by referrer and quota, and the API cannot
+// work without them being in the client. ChromeDevTools/chrome-devtools-mcp
+// says so on the line above the key:
+//
+//     // go/jtfbx. Yes, we're aware this API key is public. ;)
+//     'https://chromeuxreport.googleapis.com/v1/records:queryRecord?key=AIza...'
+//
+// Reporting that as a critical secret leak tells a team that the thing they
+// already investigated and documented is an emergency. An in-repo comment is a
+// human assertion about the code, which is exactly the trust model every linter
+// already uses for `// eslint-disable`, so honour it -- but downgrade rather
+// than suppress, and only for a deliberate, specific phrasing.
+const PUBLIC_KEY_ASSERTION =
+  /\b(?:key|token|this)\b[^\n]{0,40}\b(?:is\s+(?:intentionally\s+|deliberately\s+)?public|public\s+(?:on\s+purpose|by\s+design)|not\s+(?:a\s+)?secret|safe\s+to\s+(?:expose|publish|commit))/i;
+
 function ruleHardcodedSecret(orig, masked, file, findings) {
   // Secrets live in *string literals*. `masked.strings` records each literal
   // (raw text, start line) and excludes comments — so a key only mentioned in
@@ -857,14 +1323,23 @@ function ruleHardcodedSecret(orig, masked, file, findings) {
       const key = `${s.line}|${tok.slice(0, 12)}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      // Look at the two lines above the literal in the ORIGINAL source: masked
+      // code blanks comments, which is where the assertion lives.
+      const above = orig.split("\n").slice(Math.max(0, s.line - 3), s.line).join("\n");
+      const declaredPublic =
+        /\/\/|\/\*|\*|#/.test(above) && PUBLIC_KEY_ASSERTION.test(above);
+      const isPrivateKey = /PRIVATE KEY/.test(tok);
       findings.push(
         mkFinding(
           "MCP009",
-          "critical",
+          declaredPublic && !isPrivateKey ? "low" : "critical",
           file,
           s.line,
           1,
-          `A string literal contains what looks like ${what}. A real credential committed into an MCP server's source (and especially into a tool description/schema the model can read back) is an immediate secret leak and is in your git history forever.`,
+          `A string literal contains what looks like ${what}. A real credential committed into an MCP server's source (and especially into a tool description/schema the model can read back) is an immediate secret leak and is in your git history forever.` +
+            (declaredPublic && !isPrivateKey
+              ? " Reported at LOW: a comment directly above states this key is public. Client-delivered keys (Google/Firebase browser keys, Stripe publishable keys) are meant to ship. Confirm it is restricted by referrer/quota and carries no server-side scope."
+              : ""),
           "Remove the secret, rotate it immediately (assume it is compromised once committed), and load it from an environment variable / secret manager at runtime. Never place credentials in tool descriptions or schemas.",
           orig,
         ),
@@ -894,14 +1369,65 @@ function ruleHardcodedSecret(orig, masked, file, findings) {
 const FS_PATH_SINKS =
   /\bfs(?:\s*\.\s*promises)?\s*\.\s*(readFile|readFileSync|writeFile|writeFileSync|appendFile|appendFileSync|unlink|unlinkSync|rm|rmSync|readdir|readdirSync|createReadStream|createWriteStream|open|openSync|copyFile|copyFileSync)\s*\(|\b(readFile|writeFile|appendFile|unlink|rm|readdir|copyFile)\s*\(/g;
 
-function rulefsPathTraversal(orig, masked, file, findings) {
+const PATH_HELPERS = ["join", "resolve", "normalize", "basename"];
+
+/**
+ * Containment idioms are written two ways, and only recognising one of them
+ * was a false-positive source: `path.join(dir, name)` and, just as commonly,
+ * `import { join } from "node:path"` followed by a bare `join(dir, name)`.
+ *
+ * The bare form is only honoured when the file actually destructures that
+ * name out of node:path — same provenance discipline MCP001 uses for
+ * child_process, so a random `resolve()` from a promise helper is not
+ * mistaken for path containment.
+ *
+ * @param {string} orig unmasked source (imports live here)
+ * @returns {RegExp} matches a containment call in an expression
+ */
+function pathContainmentRe(orig) {
+  const names = new Set();
+  const importRe =
+    /(?:import\s*\{([^}]*)\}\s*from\s*['"](?:node:)?path['"]|(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*['"](?:node:)?path['"]\s*\))/g;
+  let m;
+  while ((m = importRe.exec(orig))) {
+    for (const raw of (m[1] || m[2] || "").split(",")) {
+      // handles `join`, `join as pathJoin`, `join: pathJoin`
+      const local = raw.split(/\s+as\s+|:/).pop().trim();
+      const orig_ = raw.split(/\s+as\s+|:/)[0].trim();
+      if (PATH_HELPERS.includes(orig_) && /^[\w$]+$/.test(local)) names.add(local);
+    }
+  }
+  const qualified = `\\bpath\\s*\\.\\s*(?:${PATH_HELPERS.join("|")})\\s*\\(`;
+  if (!names.size) return new RegExp(qualified);
+  const bare = `(?<![.\\w$])(?:${[...names].join("|")})\\s*\\(`;
+  return new RegExp(`${qualified}|${bare}`);
+}
+
+// A project-local path validator, by naming convention: `validatePath`,
+// `ensureInsideRoot`, `sanitizePath`, `assertSafePath`, `checkPath`, … We
+// cannot verify what these enforce (no taint tracking), so a hit here
+// DOWNGRADES the finding rather than suppressing it.
+const VALIDATOR_CALL_RE =
+  /\b(?:await\s+)?(?:[\w$]+\s*\.\s*)?((?:validate|sanitiz|assert|ensure|check|guard|verif|secure|safe)[\w$]*)\s*\(/i;
+
+function rulefsPathTraversal(orig, masked, file, findings, cfg, stats) {
   const { code } = masked;
+  // Project-declared assertions (see src/config.js). These SUPPRESS rather
+  // than downgrade, because a human explicitly took responsibility for them —
+  // but every suppression is counted and reported, so this can never quietly
+  // hide a finding.
+  const declaredValidators = new Set(cfg?.pathValidators ?? []);
+  const trustedVars = new Set(cfg?.trustedPathVars ?? []);
+  const suppress = () => {
+    if (stats) stats.suppressedByConfig = (stats.suppressedByConfig ?? 0) + 1;
+  };
   // require an fs binding so a random `readFile(` helper on another object is
   // not a finding (provenance), mirroring MCP001's discipline.
   const usesFs =
     /\bfrom\s+['"]node:fs['"]|\brequire\(\s*['"]node:fs['"]|\bfrom\s+['"]fs['"]|\brequire\(\s*['"]fs['"]|\bimport\s+fs\b|\bfs\s*\.\s*promises\b/.test(
       orig,
     );
+  const containmentRe = pathContainmentRe(orig);
   let m;
   FS_PATH_SINKS.lastIndex = 0;
   while ((m = FS_PATH_SINKS.exec(code))) {
@@ -915,14 +1441,22 @@ function rulefsPathTraversal(orig, masked, file, findings) {
     const { firstArg } = scanCallArgs(code, openIdx);
     const p = firstArg.trim();
     if (p === "") continue; // pure literal path
+    // `fs.readFileSync(0, "utf8")` reads FILE DESCRIPTOR 0 — stdin. A numeric
+    // literal is not a path and cannot be traversed; only string paths can.
+    if (/^\d+$/.test(p)) continue;
     // Any path-module containment idiom anywhere in the path expression →
     // treat as handled (low-FP stance; see header).
-    if (/\bpath\s*\.\s*(join|resolve|normalize|basename)\s*\(/.test(p)) continue;
+    if (containmentRe.test(p)) continue;
     // Now: fire only if p is a bare ident/member, OR a concat/template with a
     // dynamic part. A masked pure-literal is already `""` (skipped above).
     const isConcat = /\+/.test(p) || /\$\{/.test(p) || /^`/.test(p);
     const isBareRef = /^[\w$][\w$.[\]'"]*$/.test(p); // userPath, req.body.f
     if (!isConcat && !isBareRef) continue; // e.g. a fn() result — unknown, skip
+    // The project declared this parameter/variable pre-validated.
+    if (trustedVars.size && /^[\w$]+$/.test(p) && trustedVars.has(p)) {
+      suppress();
+      continue;
+    }
     // HOISTED-CONTAINMENT GUARD (the moat): extract-to-named-variable is
     // idiomatic SAFE code, e.g.
     //   const safe = path.resolve(BASE, path.basename(n)); readFileSync(safe)
@@ -934,6 +1468,7 @@ function rulefsPathTraversal(orig, masked, file, findings) {
     // fires; see the MCP010 STILL-fires-on-a-hoisted-variable test.) This
     // mirrors the in-arg containment skip above; favor a false negative over
     // cry-wolf, consistent with the project ethos + README Limitations.
+    let viaValidator = null;
     if (!isConcat && /^[\w$]+$/.test(p)) {
       const before = code.slice(0, m.index);
       const assignRe = new RegExp(
@@ -943,22 +1478,92 @@ function rulefsPathTraversal(orig, masked, file, findings) {
       let a;
       let lastRhs = null;
       while ((a = assignRe.exec(before))) lastRhs = a[1]; // nearest wins
-      if (
-        lastRhs &&
-        /\bpath\s*\.\s*(?:join|resolve|normalize|basename)\s*\(/.test(lastRhs)
-      ) {
+      if (lastRhs && containmentRe.test(lastRhs)) {
         continue; // hoisted containment — handled, do not fire
+      }
+      // SOFT containment: the value came out of a project-local validator
+      // (`validatePath`, `ensureInsideRoot`, `sanitizePath`, …). Without taint
+      // tracking we cannot prove what that function enforces, so we must NOT
+      // suppress — silently dropping a path-traversal finding is exactly the
+      // failure mode a security scanner cannot afford. We downgrade instead:
+      // the finding stays visible but drops out of `--fail-on high` and stops
+      // crowding out real signal. (The official MCP `filesystem` server hits
+      // this: 13 findings, all `validatePath()` output, all noise at `high`.)
+      // VALIDATE-THEN-USE. The assignment form (`const p = validatePath(x)`) is
+      // only half of it; the other half is far more common in MCP tool
+      // handlers, where the path arrives destructured straight out of the
+      // schema and is checked in place:
+      //     async ({ saveTo }) => {
+      //       validateFileExtension(saveTo, ALLOWED, "save_screenshot");
+      //       validateOutputPath(saveTo);
+      //       fs.writeFileSync(saveTo, screenshot);
+      //     }
+      // Nothing is ever assigned, so looking only at assignments missed it.
+      // Bounded look-back approximates "earlier in this function".
+      if (!viaValidator) {
+        const win = before.slice(-2000);
+        const guardRe = new RegExp(
+          `\\b((?:validate|sanitiz|assert|ensure|check|guard|verif|secure|safe)[\\w$]*)\\s*\\(\\s*${p}\\b`,
+          "i",
+        );
+        const g = guardRe.exec(win);
+        if (g) viaValidator = g[1];
+      }
+      // SAME-FILE PATH HELPER. Naming conventions only get you so far:
+      //     function getTokenFilePath() {
+      //       return path.join(getConfigDir(), 'tokens.json');
+      //     }
+      //     const tokenPath = getTokenFilePath();
+      //     await fs.writeFile(tokenPath, ...);
+      // `getTokenFilePath` matches no validator pattern, but its body is right
+      // there in the same file and visibly contains the containment idiom. That
+      // is stronger evidence than a name, so read it instead of guessing.
+      if (!viaValidator && lastRhs) {
+        const call = /(?:await\s+)?(?:[\w$]+\s*\.\s*)?([\w$]+)\s*\(/.exec(lastRhs);
+        if (call) {
+          const fn = call[1];
+          // Function declaration, assigned arrow/function, or a class method
+          // (`private resolvePath(p: string) { ... }` is just as common as a
+          // free function, and `this.resolvePath(x)` reaches it the same way).
+          const defRe = new RegExp(
+            `function\\s+${fn}\\s*\\(` +
+              `|(?:const|let|var)\\s+${fn}\\s*=` +
+              `|[\\n;{]\\s*(?:(?:private|public|protected|static|async|readonly)\\s+)*${fn}\\s*\\(`,
+          );
+          const d = defRe.exec(orig);
+          // Bounded window approximates the function body without parsing.
+          if (d && containmentRe.test(orig.slice(d.index, d.index + 600))) {
+            viaValidator = fn;
+          }
+        }
+      }
+      if (lastRhs) {
+        const v = VALIDATOR_CALL_RE.exec(lastRhs);
+        if (v) viaValidator = v[1];
+        // A validator the project explicitly declared is an assertion by a
+        // human, not a guess from a naming convention: suppress, don't
+        // downgrade. Still counted and reported.
+        if (declaredValidators.size) {
+          const d = /(?:await\s+)?(?:[\w$]+\s*\.\s*)?([\w$]+)\s*\(/.exec(lastRhs);
+          if (d && declaredValidators.has(d[1])) {
+            suppress();
+            continue;
+          }
+        }
       }
     }
     const at = lineColAt(code, m.index);
     findings.push(
       mkFinding(
         "MCP010",
-        "high",
+        viaValidator ? "low" : "high",
         file,
         at.line,
         at.col,
-        `\`${typeof fn === "string" ? fn : "fs call"}\` uses a non-literal path. In an MCP file tool reachable from tool input, an attacker can supply \`../../../etc/passwd\` (or an absolute path) and read or overwrite files outside the intended directory — path traversal / arbitrary file access.`,
+        `\`${typeof fn === "string" ? fn : "fs call"}\` uses a non-literal path. In an MCP file tool reachable from tool input, an attacker can supply \`../../../etc/passwd\` (or an absolute path) and read or overwrite files outside the intended directory — path traversal / arbitrary file access.` +
+          (viaValidator
+            ? ` Reported at LOW: this path is guarded by \`${viaValidator}()\` — either assigned from it, or passed to it earlier in this function — which looks like a project-local path validator. mcpaudit does no taint tracking and cannot verify what that function actually enforces; confirm it resolves symlinks and asserts containment against an allowlist before treating this as handled.`
+            : ""),
         "Resolve the path and assert it stays inside an allowed base dir (`const full = path.resolve(BASE, p); if (!full.startsWith(BASE + path.sep)) throw`), or reduce to `path.basename(p)` when only a filename is expected.",
         orig,
       ),
@@ -981,8 +1586,81 @@ function rulefsPathTraversal(orig, masked, file, findings) {
 const UNSAFE_DESERIALIZE =
   /(?<![.\w$])(unserialize|deserialize)\s*\(|\b(yaml|jsyaml|YAML|jsYaml)\s*\.\s*load\s*\(|(?<![.\w$])load\s*\(/g;
 
-function ruleUnsafeDeserialize(orig, masked, file, findings) {
+/**
+ * js-yaml 4 removed `safeLoad` and made `load` itself safe: it defaults to the
+ * DEFAULT_SCHEMA, which cannot instantiate arbitrary JS types. The dangerous
+ * full-schema behaviour this rule was written for belongs to js-yaml 3.x and
+ * earlier. Flagging `yaml.load` in a project that depends on ^4 is reporting a
+ * vulnerability that the dependency fixed years ago.
+ *
+ * @param {Record<string,string>|undefined} deps dependency ranges from package.json
+ * @returns {boolean} true when js-yaml is pinned to 4 or newer
+ */
+function yamlLoadIsSafe(deps) {
+  const range = deps?.["js-yaml"];
+  if (typeof range !== "string") return false;
+  const major = /(\d+)/.exec(range);
+  return Boolean(major) && Number(major[1]) >= 4;
+}
+
+// ---------------------------------------------------------------------------
+// MCP015 — a module that ships but does nothing
+//
+// Suggested by the ooples/token-optimizer-mcp maintainer after this scanner
+// skipped one of their files as "minified". It was not minified: its newlines
+// had been stripped, so the whole implementation ended up behind the `//` on
+// line 2 and the module compiled to nothing. Eight files in that repo had the
+// shape -- 82 KB of dead text in the published npm tarball, invisible to every
+// line-based tool pointed at it, this one included.
+//
+// Their framing is the right one: this is not a security rule, but "what does
+// this server actually expose" is the question an MCP audit exists to answer,
+// and a file that ships and exports nothing is a direct answer to it.
+//
+// Implemented on masked code, where comment bodies are already blanked. If
+// nothing survives masking, every byte in the file was a comment. That test has
+// no threshold and no pattern matching, so a 436-byte collapsed header is
+// caught as readily as a 55 KB collapsed implementation -- which a
+// bytes-per-line heuristic cannot do, and is why four of their eight slipped
+// past both of us.
+// ---------------------------------------------------------------------------
+function ruleDeadModule(orig, masked, file, findings) {
   const { code } = masked;
+  // Directories whose files are expected to be side-effectful or generated.
+  if (/(^|[\\/])(dist|build|out|coverage|\.next|__mocks__)[\\/]/i.test(file)) return;
+  // A file too small to be a module at all is noise, not a finding.
+  if (orig.length < 200) return;
+
+  const live = code.replace(/[\s;]+/g, "");
+  if (live.length > 0) return;
+
+  // Everything was comment. Say which shape, because the remedy differs: a
+  // deliberately commented-out file wants deleting, a collapsed one wants its
+  // newlines back.
+  const longest = orig.split("\n").reduce((m, l) => (l.length > m ? l.length : m), 0);
+  const collapsed = longest > 5000;
+  findings.push(
+    mkFinding(
+      "MCP015",
+      "low",
+      file,
+      1,
+      1,
+      `This module contains no executable code — every byte outside whitespace is inside a comment, so it compiles to an empty module. It still ships to anyone who installs the package (${orig.length} bytes).` +
+        (collapsed
+          ? ` Its longest line is ${longest} characters, so this looks like source whose newlines were stripped, leaving the body behind a line comment rather than a deliberate comment-out.`
+          : ""),
+      collapsed
+        ? "Restore the newlines from version control if the code is still wanted, or delete the file. Check whether anything imports it first — if the module has been empty in production, nothing does."
+        : "Delete it, or move it out of the published `files` list. Dead text in a shipped tarball is surface with no function.",
+      orig,
+    ),
+  );
+}
+
+function ruleUnsafeDeserialize(orig, masked, file, findings, deps) {
+  const { code } = masked;
+  const yamlSafe = yamlLoadIsSafe(deps);
   // provenance for the bare `load(` form: only consider it if js-yaml (or a
   // serialize lib) is imported, else `load(` is too generic.
   const yamlImported =
@@ -1015,6 +1693,9 @@ function ruleUnsafeDeserialize(orig, masked, file, findings) {
       )
     )
       continue;
+    // Declared js-yaml >= 4: `load` is the safe one. Only the yaml forms are
+    // cleared; `unserialize`/`deserialize` are unaffected by that version.
+    if (yamlSafe && !isUnser) continue;
     const at = lineColAt(code, m.index);
     const sevText = isUnser
       ? "Functions/`node-serialize`-style unserialize can construct and immediately invoke attacker-defined functions — direct remote code execution."
@@ -1062,7 +1743,7 @@ function splitTopLevel(s) {
  * @param {string} relPath - path label used in findings
  * @returns {Finding[]}
  */
-export function analyzeSource(src, relPath) {
+export function analyzeSource(src, relPath, cfg, stats, deps) {
   const findings = [];
   if (typeof src !== "string" || src === "") return findings;
   const masked = maskNonCode(src);
@@ -1073,8 +1754,9 @@ export function analyzeSource(src, relPath) {
   ruleProtoPollution(src, masked, relPath, findings);
   ruleSsrfFetch(src, masked, relPath, findings);
   ruleHardcodedSecret(src, masked, relPath, findings);
-  rulefsPathTraversal(src, masked, relPath, findings);
-  ruleUnsafeDeserialize(src, masked, relPath, findings);
+  rulefsPathTraversal(src, masked, relPath, findings, cfg, stats);
+  ruleUnsafeDeserialize(src, masked, relPath, findings, deps);
+  ruleDeadModule(src, masked, relPath, findings);
   return findings;
 }
 

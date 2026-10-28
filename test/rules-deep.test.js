@@ -1,5 +1,5 @@
 /**
- * rules-deep.test.js — TDD coverage for the deeper rule set MCP007–MCP014.
+ * rules-deep.test.js -- TDD coverage for the deeper rule set MCP007-MCP014.
  *
  * Every rule gets the three-way contract the project holds itself to:
  *   - a VULNERABLE case fires with the correct severity + location,
@@ -13,7 +13,7 @@ import { analyzeSource, analyzeManifest } from "../src/rules.js";
 const byRule = (fs, id) => fs.filter((f) => f.ruleId === id);
 const sev = (fs, id) => byRule(fs, id)[0]?.severity;
 
-describe("MCP005 dangerous-eval — member-call false-positive guard", () => {
+describe("MCP005 dangerous-eval -- member-call false-positive guard", () => {
   // Regression for the adversarial-review FP: `/\beval\s*\(/` etc. had NO
   // qualifier guard (unlike MCP001/MCP010 provenance). A `.eval(`/`.compile(`
   // METHOD on some object (math lib, parser, ORM) is legitimate code and must
@@ -59,7 +59,7 @@ describe("MCP005 dangerous-eval — member-call false-positive guard", () => {
   });
 
   it("STILL fires on vm.compileFunction(src) (genuine vm builtin)", () => {
-    // `vm` is a recognised Node builtin namespace — the qualifier guard must
+    // `vm` is a recognised Node builtin namespace -- the qualifier guard must
     // NOT suppress real vm code execution just because it has a `.` before it.
     const code =
       "import vm from 'node:vm';\nvm.compileFunction(attackerSrc);";
@@ -112,6 +112,201 @@ describe("MCP007 prototype pollution", () => {
     const code = "const m = Object.assign({}, { a: 1 }, opts);";
     // Object.assign is shallow and not in the recursive-merge sink list.
     expect(byRule(analyzeSource(code, "ok3.js"), "MCP007")).toHaveLength(0);
+  });
+
+  // -- the `constructor` gate, found scanning ooples/token-optimizer-mcp ------
+  // `\bconstructor\b` as a file-level "does this code touch the proto chain"
+  // signal is satisfied by the class constructor that every OO file declares.
+  // It gated nothing, and it was the ONLY reason the corpus's one true
+  // positive fired. Evidence must now be a real proto reference or a key
+  // visibly rooted at tool input.
+
+  it("fires HIGH when the key is rooted at tool input, with no proto token", () => {
+    const code = [
+      "class Server {",
+      "  constructor() { this.branches = {}; }",
+      "  process(input) { this.branches[input.branchId] = []; }",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "tp.ts"), "MCP007");
+    expect(f).toHaveLength(1);
+    expect(f[0].severity).toBe("high");
+    expect(f[0].line).toBe(3);
+  });
+
+  it("does NOT fire when a class constructor is the only proto token", () => {
+    const code = [
+      "class Counter {",
+      "  constructor() { this.byLevel = {}; }",
+      "  tally(entry) { this.byLevel[entry.level] = 1; }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "ctor.ts"), "MCP007")).toHaveLength(0);
+  });
+
+  it("downgrades to MEDIUM when the file is proto-aware but the key is opaque", () => {
+    const code = [
+      "const BAD = '__proto__';",
+      "function copy(dst, src, k) { dst[k] = src[k]; }",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "med.ts"), "MCP007");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("medium");
+  });
+
+  it("does NOT fire on a for-counter index into a numeric array", () => {
+    const code = [
+      "class Embed {",
+      "  constructor() {}",
+      "  build(n, hash) {",
+      "    const embedding = [];",
+      "    for (let i = 0; i < n; i++) { embedding[i] = hash[i] / 127.5 - 1; }",
+      "    return embedding;",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "num.ts"), "MCP007")).toHaveLength(0);
+  });
+
+  it("does NOT fire on a Levenshtein matrix write", () => {
+    const code = [
+      "class D {",
+      "  constructor() {}",
+      "  dist(a, b) {",
+      "    const matrix = [];",
+      "    for (let i = 1; i <= a; i++) {",
+      "      for (let j = 1; j <= b; j++) { matrix[i][j] = matrix[i - 1][j] + 1; }",
+      "    }",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "lev.ts"), "MCP007")).toHaveLength(0);
+  });
+
+  // -- a declaration is not a call -------------------------------------------
+
+  it("does NOT fire on a `set` METHOD DECLARATION with typed parameters", () => {
+    const code = [
+      "class LRU {",
+      "  public set(key: K, value: V, ttlMs?: number): void {",
+      "    this.cache.set(key, value);",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "lru.ts"), "MCP007")).toHaveLength(0);
+  });
+
+  it("does NOT fire on a multi-line `set(` declaration", () => {
+    const code = [
+      "class Engine {",
+      "  set(",
+      "    key: string,",
+      "    value: string,",
+      "    size: number",
+      "  ): void {",
+      "    this.store[key] = value;",
+      "  }",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "eng.ts"), "MCP007");
+    // The declaration itself must not fire; `this.store[key] = value` has no
+    // proto evidence and no external root either, so the file is silent.
+    expect(f).toHaveLength(0);
+  });
+
+  it("still fires on a genuine bare lodash-style set(obj, path, value)", () => {
+    const code = "import { set } from 'lodash';\nfunction f(o, p, v) { set(o, p, v); }";
+    const f = byRule(analyzeSource(code, "ls.js"), "MCP007");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("high");
+  });
+
+  // -- receiver capture across a TS non-null assertion ------------------------
+
+  // -- the guard must not be read as the danger, found scanning freee-mcp -----
+
+  it("downgrades to LOW behind Object.hasOwn(obj, key)", () => {
+    const code = [
+      "async function add(config, companyId) {",
+      "  if (!Object.hasOwn(config.companies, companyId)) {",
+      "    config.companies[companyId] = { id: companyId };",
+      "  }",
+      "}",
+      "const RESERVED = new Set(['__proto__', 'constructor', 'prototype']);",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "hasown.ts"), "MCP007");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("low");
+  });
+
+  it("downgrades to LOW behind a same-file validator that rejects proto keys", () => {
+    // The validator sits outside the 25-line lookback, as it does in the real
+    // freee-mcp file -- so the direct `RESERVED_KEYS.has(...)` branch cannot
+    // see it and the finding rests entirely on reading the validator's body.
+    const code = [
+      "const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);",
+      "function assertSafeCompanyId(companyId) {",
+      "  if (RESERVED_KEYS.has(companyId)) throw new Error('bad id');",
+      "}",
+      ...Array(30).fill("// filler"),
+      "function add(config, companyId) {",
+      "  assertSafeCompanyId(companyId);",
+      "  config.companies[companyId] = { id: companyId };",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "validator.ts"), "MCP007");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("low");
+    expect(f[0].message).toMatch(/assertSafeCompanyId/);
+  });
+
+  it("does NOT downgrade for a same-name call whose body never mentions proto", () => {
+    const code = [
+      "const BAD = '__proto__';",
+      "function trim(k) { return k.trim(); }",
+      "function add(o, k, v) { trim(k); o[k] = v; }",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "nodowngrade.ts"), "MCP007");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).not.toBe("low");
+  });
+
+  // -- a string-literal union type is a closed set, found in mongodb-mcp-server
+
+  it("does NOT fire when the key's TS type is a union of string literals", () => {
+    const code = [
+      "class ToolBase {",
+      "  release() { const ctor = this.constructor; return ctor; }",
+      '  private redirect(property: "argsShape" | "outputSchema", shape: Shape): void {',
+      "    this[property] = shape;",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "union.ts"), "MCP007")).toHaveLength(0);
+  });
+
+  it("STILL fires when a literal union actually contains a proto key", () => {
+    const code = [
+      "class Evil {",
+      "  release() { const ctor = this.constructor; return ctor; }",
+      '  set(property: "argsShape" | "__proto__", shape: Shape): void {',
+      "    this[property] = shape;",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(
+      byRule(analyzeSource(code, "evil.ts"), "MCP007").length,
+    ).toBeGreaterThanOrEqual(1);
+  });
+
+  it("does NOT fire on Map.set reached through a `!` non-null assertion", () => {
+    const code = [
+      "class P {",
+      "  constructor() { this.m = new Map(); }",
+      "  link(k, other, sim) { this.m.get(k)!.set(other, sim); }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "map.ts"), "MCP007")).toHaveLength(0);
   });
 });
 
@@ -465,7 +660,7 @@ describe("MCP014 risky declared dependency (static, no registry)", () => {
       "package.json",
     );
     // An old lodash is a known-CVE version, but we deliberately do NOT
-    // assert that (no offline vuln DB) — so MCP014 must stay silent here.
+    // assert that (no offline vuln DB) -- so MCP014 must stay silent here.
     expect(byRule(all, "MCP014")).toHaveLength(0);
   });
 });
@@ -479,5 +674,126 @@ describe("manifest rules are shape-aware (no cross-manifest double-fire)", () =>
     );
     expect(byRule(f, "MCP012")).toHaveLength(0);
     expect(byRule(f, "MCP014")).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MCP009 -- a key the code itself says is public.
+// Found scanning ChromeDevTools/chrome-devtools-mcp, which bluesky-social and
+// others install. The key below is a SYNTHETIC 39-char value with the right
+// shape; never put a real credential in a test fixture.
+// ---------------------------------------------------------------------------
+const FAKE_GOOGLE_KEY = "AIzaSyA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q";
+
+describe("MCP009 hardcoded secret", () => {
+  it("downgrades when a comment directly above declares the key public", () => {
+    const code = [
+      "async function crux() {",
+      "  // go/jtfbx. Yes, we're aware this API key is public. ;)",
+      "  setEndpoint(",
+      `    'https://chromeuxreport.googleapis.com/v1/records?key=${FAKE_GOOGLE_KEY}',`,
+      "  );",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "crux.ts"), "MCP009");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("low");
+    expect(f[0].message).toMatch(/restricted by referrer/);
+  });
+
+  it("STILL reports CRITICAL without such a comment", () => {
+    const code = [
+      "async function crux() {",
+      "  // fetch field data",
+      "  setEndpoint(",
+      `    'https://chromeuxreport.googleapis.com/v1/records?key=${FAKE_GOOGLE_KEY}',`,
+      "  );",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "crux2.ts"), "MCP009");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("critical");
+  });
+
+  it("NEVER downgrades a PRIVATE KEY, whatever the comment claims", () => {
+    const code = [
+      "// this key is public, honest",
+      "const k = `-----BEGIN RSA PRIVATE KEY-----`;",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "pk.ts"), "MCP009");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("critical");
+  });
+
+  it("does not treat an unrelated nearby comment as an assertion", () => {
+    const code = [
+      "// the public API is documented at example.com",
+      `const k = '${FAKE_GOOGLE_KEY}';`,
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "unrel.ts"), "MCP009");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("critical");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MCP015 -- a module that ships but does nothing, and telling a COLLAPSED file
+// from a MINIFIED one. Both suggested by the ooples/token-optimizer-mcp
+// maintainer after this scanner skipped one of their files as "minified" when
+// it was not: its newlines had been stripped and the body sat behind a `//`.
+// ---------------------------------------------------------------------------
+describe("MCP015 dead module", () => {
+  it("fires on a file whose entire body is behind a line comment", () => {
+    const body = "const x = 1; ".repeat(60);
+    const code = "/** header */\n// " + body;
+    const f = byRule(analyzeSource(code, "collapsed.ts"), "MCP015");
+    expect(f).toHaveLength(1);
+    expect(f[0].severity).toBe("low");
+    expect(f[0].message).toMatch(/no executable code/);
+  });
+
+  it("fires on a barrel file emptied to comments, with no long line at all", () => {
+    // 257 bytes, 10 short lines, zero exports -- the real
+    // src/tools/dashboard-monitoring/index.ts. A bytes-per-line heuristic
+    // cannot see this one; masking-to-empty can.
+    const code = [
+      "/**",
+      " * Dashboard & Monitoring Tools - Track 2E",
+      " *",
+      " * Export all dashboard and monitoring tools",
+      " */",
+      "",
+      "// SmartDashboard - Implementation pending",
+      "// MetricCollector - Implementation pending",
+      "// Note: Exports temporarily removed until implementation is complete",
+      "// padding to clear the 200-byte floor ..........................",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "barrel.ts"), "MCP015");
+    expect(f).toHaveLength(1);
+    // No 5000-char line, so the message must NOT claim newlines were stripped.
+    expect(f[0].message).not.toMatch(/newlines were stripped/);
+  });
+
+  it("does NOT fire on a file with real code and heavy comments", () => {
+    const code = [
+      "/** A big explanatory header that goes on for a while, as good code does.",
+      " * More prose here so comments outweigh the code by bytes.",
+      " * Still more, because that is normal and must not be a finding.",
+      " */",
+      "export function add(a, b) {",
+      "  // inline comment",
+      "  return a + b;",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "live.ts"), "MCP015")).toHaveLength(0);
+  });
+
+  it("does NOT fire on a short file", () => {
+    expect(byRule(analyzeSource("// tiny\n", "t.ts"), "MCP015")).toHaveLength(0);
+  });
+
+  it("does NOT fire on generated output directories", () => {
+    const code = "/** x */\n// " + "const y = 2; ".repeat(60);
+    expect(byRule(analyzeSource(code, "dist/bundle.js"), "MCP015")).toHaveLength(0);
   });
 });

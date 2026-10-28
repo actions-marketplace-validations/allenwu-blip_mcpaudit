@@ -8,13 +8,77 @@ reads that code *before* you trust it and points out the dangerous bits — the
 quick safety check that doesn't really exist for these plugins yet.
 
 ```bash
-npx allenwu-blip/mcpaudit ./path-to-an-mcp-server
+npx allenwu-blip/mcpaudit#0040ed63d9bae5b0fbe0323928178455253034e9 ./path-to-an-mcp-server
 ```
 
 No install, no setup, no API key, no internet needed. It reads the plugin's
 source code and its settings file and flags risky patterns, ranked by how bad
 they are, each with a concrete fix. It **never runs** the code it is checking —
 it only reads it.
+
+---
+
+## Track record
+
+This has been run against real servers, and every finding was read by hand
+before it was reported to anyone.
+
+- **12 MCP servers audited** — the four official TypeScript reference
+  implementations plus eight third-party ones. Public reports filed on MongoDB,
+  Softeria, mobile-mcp, mcpvault, mcp-server-neon, freee, ssh-mcp and
+  token-optimizer.
+- **A maintainer independently checked the triage.** From
+  [ms-365-mcp-server#651](https://github.com/Softeria/ms-365-mcp-server/issues/651),
+  which they then closed as completed: *"I spot-checked the `src/` ones and your
+  triage matches what I see."*
+- **MongoDB routed the report into internal tracking** —
+  [issue #1470](https://github.com/mongodb-js/mongodb-mcp-server/issues/1470),
+  Jira MCP-637.
+- **A user found a false negative and it got fixed.** That same maintainer
+  pointed out a `spawn` this scanner had missed, because they inject it as a
+  class field so the call site reads `spawnCommand` rather than an imported
+  name. Aliases are now resolved; seven regression tests cover it.
+
+Triaging that corpus turned up **22 precision bugs in this tool**, which is the
+more useful number. Findings across the twelve repositories went 652 → 436 and
+criticals 105 → 9 — that is the raw hit count moving, not a false-positive rate.
+
+Four of the 22 were the same mistake: a *defence* reported as the vulnerability
+— an allowlist guard, a reserved-key set containing `__proto__`, a file named
+`safe-exec.ts` documenting the CWE-78 mitigation it enforces, and a Google API
+key one line under a comment saying it is public. Defensive code and vulnerable
+code look alike at the token level; the difference is the direction of the
+logic. A scanner that cannot tell them apart punishes the teams that did the
+work. Avoiding that is most of what the rules above are for.
+
+Write-ups: [scanning 12 MCP servers](https://gist.github.com/allenwu-blip/d20a110207dd36cd3b4d86f3960ec215)
+· [what 396 repos actually install](https://gist.github.com/allenwu-blip/817f4a181ec9ef050b6a25e992cdad4e)
+
+---
+
+## Hiring me to do this to your code
+
+The scanner is free and always will be. The thing it cannot do is read your
+source and tell you which hits are real — that part is me, by hand, and I do
+it for money.
+
+**What you get:** a scan, a hand-triage of every single finding marked *real*,
+*not real*, or *can't tell from here* with the reasoning shown, and a report
+written so an engineer can act on it without rerunning anything. If a finding
+turns out to be your mitigation rather than your bug, I say so — that mistake
+is the one I have made most often and the one I now check hardest for.
+
+**What you don't get, stated up front:** JavaScript and TypeScript only, not
+Go, Rust, C#, Python or Solidity. Lexical static analysis with no taint
+tracking and no cross-file data flow. My deliverable says *"no exploitable
+issues found in the code as written"* — never *"this code is secure."*
+
+**First one is free.** Pick a repository, I scan and triage it, and send back
+the findings. If it isn't up to your standard you keep the report and we stop
+there — you have lost nothing and I have lost an afternoon.
+
+To start: [open an issue](https://github.com/allenwu-blip/mcpaudit/issues/new)
+with the repo, or message [@allenwu-blip](https://github.com/allenwu-blip).
 
 ---
 
@@ -41,24 +105,36 @@ LLM-visible context, and over-broad filesystem/tool scope.
 It's zero-install via `npx`. A local path is scanned fully offline:
 
 ```bash
+# Pin to a commit. Read it first if you like — that is the point of a pin.
+MCPAUDIT='allenwu-blip/mcpaudit#0040ed63d9bae5b0fbe0323928178455253034e9'
+
 # scan a server you cloned / vendored
-npx allenwu-blip/mcpaudit ./vendor/some-mcp-server
+npx "$MCPAUDIT" ./vendor/some-mcp-server
 
 # machine-readable output for CI / tooling
-npx allenwu-blip/mcpaudit ./server --json
+npx "$MCPAUDIT" ./server --json
 
 # SARIF v2.1.0 (a standard scan-results format GitHub understands) —
 # upload it so findings show in GitHub's Code scanning tab
-npx allenwu-blip/mcpaudit ./server --sarif > mcpaudit.sarif
+npx "$MCPAUDIT" ./server --sarif > mcpaudit.sarif
 
 # stricter gate: any high or critical fails the command
-npx allenwu-blip/mcpaudit ./server --fail-on high
+npx "$MCPAUDIT" ./server --fail-on high
 
 # continuous monitoring: accept current state, then gate only on NEW
 # regressions (offline, no accounts) — see "Continuous monitoring" below
-npx allenwu-blip/mcpaudit ./server --baseline-write .mcpaudit-baseline.json
-npx allenwu-blip/mcpaudit ./server --baseline .mcpaudit-baseline.json
+npx "$MCPAUDIT" ./server --baseline-write .mcpaudit-baseline.json
+npx "$MCPAUDIT" ./server --baseline .mcpaudit-baseline.json
 ```
+
+> **Why the commit hash.** `npx allenwu-blip/mcpaudit` — no hash — runs
+> whatever is on `main` at the moment you type it, which is a stranger's
+> code that can change between your two runs. A security tool asking you to
+> do that is a tool that has not read its own MCP006 rule. The pin above is
+> the commit these docs were written against; `git log` it, diff it, or
+> replace it with a later one you have looked at. This suggestion came from
+> [@ooples](https://github.com/ooples), who declined to run the unpinned
+> form and audited by hand instead. He was right.
 
 > Scanning by **bare package name** (`npx mcpaudit some-mcp-pkg`) needs a
 > registry/tarball fetch wired up; the published build asks you to pass a
@@ -123,6 +199,46 @@ findings**; it is part of CI.
 | `--sarif` | SARIF v2.1.0 | upload with `github/codeql-action/upload-sarif@v3` to populate the **Code scanning** tab; each result carries the stable finding id as a `partialFingerprint` so GitHub de-dupes across runs |
 | `--monitor-json` | JSON | (with `--baseline`) the structured monitoring record — the machine contract a hosted tier would consume; this build only prints it locally |
 
+### Project config (`mcpaudit.config.json`) — for what the analyzer can't know
+
+There is exactly one thing a lexical scanner cannot resolve on its own: a path
+that reaches an `fs.*` call as a **function parameter**. There is no assignment
+to look back at, and without taint tracking there is no way to know whether the
+caller validated it. The official MCP `filesystem` server is the canonical
+case — its `lib.ts` exports functions taking a path, and every real caller runs
+`validatePath()` first, but the scanner can only see the callee.
+
+Drop a `mcpaudit.config.json` at the scan root to tell it what you know:
+
+```json
+{
+  "pathValidators":  ["validatePath", "assertInsideRoot"],
+  "trustedPathVars": ["filePath", "tempPath", "currentPath"]
+}
+```
+
+| key | meaning |
+|-----|---------|
+| `pathValidators` | a value assigned from one of these calls is treated as **contained**, instead of merely downgraded to `low` |
+| `trustedPathVars` | variable/parameter names you assert are validated before reaching a filesystem call |
+
+Both are assertions by a human who took responsibility, so they suppress rather
+than downgrade. Unknown keys and non-identifier entries are ignored and
+reported; a malformed file never aborts the scan.
+
+**Suppression is never silent.** Every run prints how many findings the config
+removed, in the human report and in `--json`:
+
+```
+diagnostics (scan was degraded, not aborted):
+  - 13 finding(s) suppressed by mcpaudit.config.json (pathValidators /
+    trustedPathVars). Delete or rename that file to see them.
+```
+
+A scanner that quietly drops findings because of a file in the repo it just
+scanned is worse than one that over-reports. If you inherit a repo with this
+file in it, you can see at a glance that it is there and what it cost you.
+
 ### Continuous monitoring (baseline diff — free, offline, no accounts)
 
 A one-shot scan tells you today's state. A team usually wants *"did anything
@@ -131,13 +247,13 @@ committed baseline — pure, deterministic, offline, no sign-up:
 
 ```bash
 # 1. accept the current state into a baseline and commit it
-npx allenwu-blip/mcpaudit ./server --baseline-write .mcpaudit-baseline.json
+npx allenwu-blip/mcpaudit#0040ed63d9bae5b0fbe0323928178455253034e9 ./server --baseline-write .mcpaudit-baseline.json
 git add .mcpaudit-baseline.json && git commit -m "mcpaudit baseline"
 
 # 2. in CI: re-scan and gate ONLY on NEW findings (regressions). An
 #    already-triaged finding no longer re-breaks every build; a freshly
 #    introduced one does.
-npx allenwu-blip/mcpaudit ./server --baseline .mcpaudit-baseline.json --fail-on high
+npx allenwu-blip/mcpaudit#0040ed63d9bae5b0fbe0323928178455253034e9 ./server --baseline .mcpaudit-baseline.json --fail-on high
 ```
 
 The baseline file is intentionally **timestamp/host/user-free** so re-writing
